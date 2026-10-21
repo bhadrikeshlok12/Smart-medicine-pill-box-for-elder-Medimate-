@@ -1,1 +1,244 @@
+// Smart Medicine Reminder Box - single pill box (ESP32 + DS3231 + IR sensor + Blynk)
+//
+// Blynk template datastreams (virtual pins):
+//   V1  Dose 1 time   Integer 0-2359  default 800   (HHMM, 1330 = 1:30 pm)
+//   V2  Dose 2 time   Integer 0-2359  default 1400
+//   V3  Dose 3 time   Integer 0-2359  default 2000
+//   V10 Status        String
+//
+// Blynk events (event codes must match exactly):
+//   dose_missed      (Critical, push notification)
+//   dose_taken       (Info)
+//   pillbox_restart  (Warning, push notification)
+
+// ---- Blynk credentials: paste from your device page. Must be BEFORE the includes ----
+#define BLYNK_TEMPLATE_ID   "TMPL3y-PpJVkS"
+#define BLYNK_TEMPLATE_NAME "Smart Pillbox"
+#define BLYNK_AUTH_TOKEN    "IIrnJYmeAL8PElr_IQwA9y18CxAheFqQ"
+
+#include <Wire.h>
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <Preferences.h>
+#include <RTClib.h>
+#include <LiquidCrystal_I2C.h>
+
+// ---- Wi-Fi ----
+const char* WIFI_SSID = "Pill box";
+const char* WIFI_PASS = "pill12345678";
+
+// ---- Pins ----
+const int irPin     = 32;   // IR sensor OUT: LOW = lid closed, HIGH = lid open
+const int ledPin    = 13;
+const int buzzerPin = 17;   // via BC547
+const int buttonPin = 4;    // snooze, to GND (INPUT_PULLUP)
+
+// ---- Schedule: up to 3 doses a day ----
+const int NUM = 3;
+
+// ---- Timing ----
+const unsigned long GRACE_MS  = 15UL * 60UL * 1000UL;   // time allowed to take the dose
+const unsigned long SNOOZE_MS = 2UL * 60UL * 1000UL;    // buzzer silence after button press
+const unsigned long RETRY_MS  = 15000UL;                // Blynk reconnect interval
+
+// ---- Objects ----
+RTC_DS3231 rtc;
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+Preferences prefs;
+
+// ---- State ----
+int  doseHHMM[NUM] = {800, 1400, 2000};   // overwritten from flash / dashboard
+bool doneToday[NUM] = {false, false, false};
+int  pending[NUM]   = {0, 0, 0};          // 0 none, 1 taken, 2 missed (waiting for Wi-Fi)
+bool active = false;
+bool armed = false;                       // lid seen closed after the reminder started
+int  activeDose = -1;
+unsigned long startMs = 0;
+unsigned long snoozeUntil = 0;
+unsigned long msgUntil = 0;
+unsigned long lastTry = 0;
+unsigned long lastIdle = 0;
+int  lastDay = -1;
+bool bootReported = false;
+
+// ---------------- helpers ----------------
+bool validHHMM(int v) {
+  return v >= 0 && (v / 100) < 24 && (v % 100) < 60;
+}
+
+void saveTimes() {
+  prefs.begin("pillbox", false);
+  prefs.putBytes("dose", doseHHMM, sizeof(doseHHMM));
+  prefs.end();
+}
+
+void loadTimes() {
+  prefs.begin("pillbox", true);
+  if (prefs.isKey("dose")) prefs.getBytes("dose", doseHHMM, sizeof(doseHHMM));
+  prefs.end();
+}
+
+void setDose(int i, int v) {
+  if (validHHMM(v)) {
+    doseHHMM[i] = v;
+    saveTimes();
+  } else {
+    Blynk.virtualWrite(1 + i, doseHHMM[i]);   // put the old value back on the dashboard
+  }
+}
+
+String doseLabel(int i) {
+  return String("Dose ") + (i + 1);
+}
+
+void showMsg(const String& l1, const String& l2) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(l1);
+  lcd.setCursor(0, 1);
+  lcd.print(l2);
+  msgUntil = millis() + 5000UL;
+}
+
+void showIdle(const DateTime& now) {
+  char b[17];
+  snprintf(b, sizeof(b), "%02d:%02d  Pillbox  ", now.hour(), now.minute());
+  lcd.setCursor(0, 0);
+  lcd.print(b);
+  lcd.setCursor(0, 1);
+  lcd.print(Blynk.connected() ? "Online          " : "Offline         ");
+}
+
+// ---------------- Blynk ----------------
+BLYNK_CONNECTED() {
+  Blynk.syncVirtual(V1, V2, V3);              // pull the caregiver's schedule
+  Blynk.virtualWrite(V10, "Online");
+  if (!bootReported) {
+    Blynk.logEvent("pillbox_restart", "Pillbox powered on");
+    bootReported = true;
+  }
+}
+
+BLYNK_WRITE(V1) { setDose(0, param.asInt()); }
+BLYNK_WRITE(V2) { setDose(1, param.asInt()); }
+BLYNK_WRITE(V3) { setDose(2, param.asInt()); }
+
+void sendEvent(int i, int state) {
+  String label = doseLabel(i);
+  if (state == 1) {
+    Blynk.virtualWrite(V10, label + ": Taken");
+    Blynk.logEvent("dose_taken", label + " taken");
+  } else {
+    Blynk.virtualWrite(V10, label + ": Missed");
+    Blynk.logEvent("dose_missed", label + " missed");
+  }
+}
+
+void flushPending() {
+  if (!Blynk.connected()) return;
+  for (int i = 0; i < NUM; i++) {
+    if (pending[i] != 0) {
+      sendEvent(i, pending[i]);
+      pending[i] = 0;
+    }
+  }
+}
+
+void report(int i, bool taken) {
+  pending[i] = taken ? 1 : 2;     // sent now if online, otherwise as soon as Wi-Fi returns
+  flushPending();
+}
+
+// ---------------- dose logic ----------------
+void finishDose(bool taken) {
+  active = false;
+  doneToday[activeDose] = true;
+  digitalWrite(ledPin, LOW);
+  showMsg(taken ? "Dose taken" : "Dose missed", doseLabel(activeDose));
+  report(activeDose, taken);
+}
+
+// ---------------- setup / loop ----------------
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22);
+
+  pinMode(irPin, INPUT);
+  pinMode(ledPin, OUTPUT);
+  pinMode(buzzerPin, OUTPUT);
+  pinMode(buttonPin, INPUT_PULLUP);
+
+  lcd.init();
+  lcd.backlight();
+  lcd.print("Pillbox starting");
+
+  if (!rtc.begin()) Serial.println("RTC not found - check wiring");
+  if (rtc.lostPower()) rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));   // first-time time set
+
+  loadTimes();
+
+  WiFi.begin(WIFI_SSID, WIFI_PASS);   // non-blocking: reminders work even without Wi-Fi
+  Blynk.config(BLYNK_AUTH_TOKEN);
+}
+
+void loop() {
+  // ---- connection handling ----
+  if (Blynk.connected()) {
+    Blynk.run();
+    flushPending();
+  } else if (millis() - lastTry > RETRY_MS) {
+    lastTry = millis();
+    if (WiFi.status() == WL_CONNECTED) Blynk.connect(2000);
+    else WiFi.begin(WIFI_SSID, WIFI_PASS);
+  }
+
+  DateTime now = rtc.now();
+  int hhmm = now.hour() * 100 + now.minute();
+
+  if (now.day() != lastDay) {                 // new day: clear the flags
+    lastDay = now.day();
+    for (int i = 0; i < NUM; i++) doneToday[i] = false;
+  }
+
+  if (digitalRead(buttonPin) == LOW) snoozeUntil = millis() + SNOOZE_MS;
+
+  // 1. start a reminder at a scheduled dose time
+  if (!active) {
+    for (int i = 0; i < NUM; i++) {
+      if (!doneToday[i] && hhmm == doseHHMM[i]) {
+        active = true;
+        activeDose = i;
+        startMs = millis();
+        armed = (digitalRead(irPin) == LOW);   // only count a lid OPENING after it was closed
+        digitalWrite(ledPin, HIGH);
+        showMsg("Take medicine", doseLabel(i));
+        break;
+      }
+    }
+  }
+
+  if (active) {
+    // 2. dose taken = lid opened
+    bool lidOpen = (digitalRead(irPin) == HIGH);
+    if (!armed) {
+      if (!lidOpen) armed = true;
+    } else if (lidOpen) {
+      finishDose(true);
+    }
+    // 3. grace time over = missed
+    if (active && millis() - startMs > GRACE_MS) finishDose(false);
+  }
+
+  // ---- buzzer: 500 ms on / 500 ms off while a reminder is active, unless snoozed ----
+  bool beep = active && millis() > snoozeUntil && ((millis() / 500) % 2 == 0);
+  digitalWrite(buzzerPin, beep ? HIGH : LOW);
+
+  // ---- idle screen ----
+  if (!active && millis() > msgUntil && millis() - lastIdle > 1000) {
+    lastIdle = millis();
+    showIdle(now);
+  }
+
+  delay(50);
+}
 
