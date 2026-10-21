@@ -61,7 +61,7 @@ Traditional pill organisers store tablets but do not remind the user or inform a
 
 ## System Architecture
 
-![System block diagram]([Doc/Block-Diagram.png)
+![System block diagram]([Doc/block-diagram.png)
 
 The ESP32 stores the dose schedule, watches the clock and the lid sensor, and decides when to remind the user and when to alert the caregiver.
 
