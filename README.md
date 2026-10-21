@@ -138,8 +138,8 @@ Suggested pin mapping for an **ESP32 DevKit V1**. Confirm against your own board
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/<your-username>/<your-repo-name>.git
-   cd <your-repo-name>
+   git clone https://github.com/<bhadrikeshlok12>/<Smart-medicine-pill-box-for-elder-Medimate>.git
+   cd <Smart-medicine-pill-box-for-elder-Medimate>
    ```
 2. **Assemble the hardware** following the [circuit connections](#circuit-connections).
 3. **Open the sketch** in the Arduino IDE and select the board **ESP32 Dev Module**.
